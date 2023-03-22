@@ -3,6 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import java.util.function.Predicate
+import org.opensearch.gradle.testclusters.OpenSearchCluster
+import org.opensearch.gradle.testclusters.StandaloneRestIntegTestTask
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSession
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+import java.security.cert.X509Certificate
+import javax.net.ssl.HostnameVerifier
+import java.security.GeneralSecurityException
+
 buildscript {
 
     ext {
@@ -47,10 +59,7 @@ plugins {
 
 }
 
-checkstyle {
-    toolVersion = '9.3'
-    configFile file("checkstyle/checkstyle.xml")
-}
+def securityEnabled = System.getProperty("security", "false") == "true"
 
 spotbugsMain {
     excludeFilter = file("checkstyle/findbugs-exclude.xml")
@@ -152,16 +161,6 @@ project.afterEvaluate {
 }
 
 publishing {
-    repositories {
-        maven {
-            name = "Snapshots" //  optional target repository name
-            url = "https://aws.oss.sonatype.org/content/repositories/snapshots"
-            credentials {
-                username "$System.env.SONATYPE_USERNAME"
-                password "$System.env.SONATYPE_PASSWORD"
-            }
-        }
-    }
     publications {
         pluginZip(MavenPublication) { publication ->
             pom {
@@ -278,7 +277,6 @@ dependencies {
             force "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${jacksonVersion}"
             force "org.apache.commons:commons-lang3:3.12.0"
             force "org.slf4j:slf4j-api:2.0.0"
-            force "org.apache.bcel:bcel:6.6.0" // This line should be removed once Spotbugs is upgraded to 4.7.4
         }
     }
 
@@ -590,33 +588,169 @@ task integTestRemote(type: RestIntegTestTask) {
     systemProperty "password", System.getProperty("password")
 }
 
-String bwcVersion = "2.1.0.0"
+String bwcVersionShort = "2.6.0"
+String bwcVersion = bwcVersionShort + ".0"
 String baseName = "paBwcCluster"
 String bwcFilePath = "src/test/resources/org/opensearch/performanceanalyzer/bwc/"
-String bwcRemoteFile = "https://ci.opensearch.org/ci/dbc/distribution-build-opensearch/2.1.0/5757/linux/x64/tar/builds/opensearch/plugins/opensearch-performance-analyzer-2.1.0.0.zip"
-String bwcOpenSearchPlugin = "opensearch-performance-analyzer-2.1.0.0.zip"
+String bwcPaRemoteFile = 'https://ci.opensearch.org/ci/dbc/distribution-build-opensearch/' + bwcVersionShort + '/latest/linux/x64/tar/builds/' +
+        'opensearch/plugins/opensearch-performance-analyzer-' + bwcVersion + '.zip'
+
+
+ext.getPluginResource = { download_to_folder, download_from_src ->
+    def src_split = download_from_src.split("/")
+    def download_file = src_split[src_split.length - 1]
+    if (!fileTree(download_to_folder).contains(new File("$project.rootDir/$download_to_folder/$download_file"))) {
+        println "Downloading ${download_file}"
+        project.delete download_to_folder
+        project.mkdir download_to_folder
+        ant.get(src: download_from_src,
+                dest: download_to_folder,
+                httpusecaches: false)
+    }
+    return fileTree(download_to_folder).getSingleFile()
+}
+
+class WaitForClusterYellow {
+
+    private URL url
+    private String username
+    private String password
+    Set<Integer> validResponseCodes = Collections.singleton(200)
+
+    WaitForClusterYellow(String protocol, String host, int numberOfNodes) throws MalformedURLException {
+        this(new URL(protocol + "://" + host + "/_cluster/health?wait_for_nodes=>=" + numberOfNodes + "&wait_for_status=yellow"))
+    }
+
+    WaitForClusterYellow(URL url) {
+        this.url = url
+    }
+
+    boolean wait(int durationInMs) throws GeneralSecurityException, InterruptedException, IOException {
+        final long waitUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(durationInMs)
+        final long sleep = 100
+
+        IOException failure = null
+        while (true) {
+            try {
+                checkResource()
+                return true
+            } catch (IOException e) {
+                failure = e
+            }
+            if (System.nanoTime() < waitUntil) {
+                Thread.sleep(sleep)
+            } else {
+                throw failure
+            }
+        }
+    }
+
+    void setUsername(String username) {
+        this.username = username
+    }
+
+    void setPassword(String password) {
+        this.password = password
+    }
+
+    void checkResource() throws IOException {
+        final HttpURLConnection connection = buildConnection()
+        connection.connect()
+        final Integer response = connection.getResponseCode()
+        if (validResponseCodes.contains(response)) {
+            return
+        } else {
+            throw new IOException(response + " " + connection.getResponseMessage())
+        }
+    }
+
+    HttpURLConnection buildConnection() throws IOException {
+        final HttpURLConnection connection = (HttpURLConnection) this.@url.openConnection()
+
+        if (connection instanceof HttpsURLConnection) {
+            TrustManager[] trustAllCerts = [new X509TrustManager() {
+                X509Certificate[] getAcceptedIssuers() {
+                    return null
+                }
+
+                void checkClientTrusted(X509Certificate[] certs, String authType) {
+                }
+
+                void checkServerTrusted(X509Certificate[] certs, String authType) {
+                }
+            }
+            ] as TrustManager[]
+            SSLContext sc = SSLContext.getInstance("SSL")
+            sc.init(null, trustAllCerts, new java.security.SecureRandom())
+            connection.setSSLSocketFactory(sc.getSocketFactory())
+            // Create all-trusting host name verifier
+            HostnameVerifier allHostsValid = new HostnameVerifier() {
+                boolean verify(String hostname, SSLSession session) {
+                    return true
+                }
+            }
+            // Install the all-trusting host verifier
+            connection.setHostnameVerifier(allHostsValid)
+        }
+
+        configureBasicAuth(connection)
+        connection.setRequestMethod("GET")
+        return connection
+    }
+
+    void configureBasicAuth(HttpURLConnection connection) {
+        if (username != null) {
+            if (password == null) {
+                throw new IllegalStateException("Basic Auth user [" + username + "] has been set, but no password has been configured")
+            }
+            connection.setRequestProperty(
+                    "Authorization",
+                    "Basic " + Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8))
+            )
+        }
+    }
+
+}
+
+def waitForClusterSetup(OpenSearchCluster cluster, Boolean securityEnabled) {
+    println("Waiting mark")
+    cluster.@waitConditions.clear()
+    String unicastUris = cluster.nodes.stream().flatMap { node ->
+        node.getAllTransportPortURI().stream()
+    }.collect(Collectors.joining("\n"))
+    cluster.nodes.forEach { node ->
+        try {
+            Files.write(node.getConfigDir().resolve("unicast_hosts.txt"), unicastUris.getBytes(StandardCharsets.UTF_8))
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException("Failed to write configuation files for " + this, e)
+        }
+    }
+
+    Predicate pred = {
+        String protocol = securityEnabled ? "https" : "http"
+        WaitForClusterYellow wait = new WaitForClusterYellow(protocol, cluster.getFirstNode().getHttpSocketURI(), cluster.nodes.size())
+        wait.setUsername(System.getProperty("user", "admin"))
+        wait.setPassword(System.getProperty("password", "admin"))
+        return wait.wait(180000)
+    }
+
+    cluster.@waitConditions.put("cluster health yellow", pred)
+    cluster.waitForAllConditions()
+}
 
 2.times {i ->
     testClusters {
         "${baseName}$i" {
             testDistribution = "ARCHIVE"
-            versions = ["2.1.0", opensearch_version]
+            versions = [bwcVersionShort, opensearch_version]
             numberOfNodes = 3
-            plugin(provider(new Callable<RegularFile>(){
+            plugin(provider(new Callable<RegularFile>() {
                 @Override
                 RegularFile call() throws Exception {
                     return new RegularFile() {
                         @Override
                         File getAsFile() {
-                            File dir = new File(bwcFilePath + bwcVersion)
-                            if (!dir.exists()) {
-                                dir.mkdirs()
-                            }
-                            File f = new File(bwcFilePath + bwcVersion + "/" + bwcOpenSearchPlugin)
-                            if (!f.exists()) {
-                                new URL(bwcRemoteFile).withInputStream{ ins -> f.withOutputStream{ it << ins }}
-                            }
-                            return fileTree(bwcFilePath + bwcVersion).getSingleFile()
+                            return getPluginResource(bwcFilePath + bwcVersionShort + '/', bwcPaRemoteFile)
                         }
                     }
                 }
@@ -663,7 +797,10 @@ task "${baseName}#mixedClusterTask"(type: StandaloneRestIntegTestTask) {
     useCluster testClusters."${baseName}0"
     dependsOn "${baseName}#oldVersionClusterTask0"
     doFirst {
+        println("Pre-Upgrade mark")
         testClusters."${baseName}0".upgradeNodeAndPluginToNextVersion(plugins)
+        println("Post-Upgrade mark")
+        waitForClusterSetup(testClusters."${baseName}$i", securityEnabled)
     }
     filter {
         includeTestsMatching "org.opensearch.performanceanalyzer.bwc.*IT"
