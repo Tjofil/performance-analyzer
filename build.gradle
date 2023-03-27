@@ -14,6 +14,12 @@ import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 import javax.net.ssl.HostnameVerifier
 import java.security.GeneralSecurityException
+import java.util.concurrent.Callable
+import java.nio.charset.StandardCharsets
+import java.util.stream.Collectors
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
+
 
 buildscript {
 
@@ -728,7 +734,7 @@ def waitForClusterSetup(OpenSearchCluster cluster, Boolean securityEnabled) {
 
     Predicate pred = {
         String protocol = securityEnabled ? "https" : "http"
-        WaitForClusterYellow wait = new WaitForClusterYellow(protocol, cluster.getFirstNode().getHttpSocketURI(), cluster.nodes.size())
+        WaitForClusterYellow wait = new WaitForClusterYellow(protocol, cluster.nodes["paBwcCluster0-0"].getHttpSocketURI(), cluster.nodes.size())
         wait.setUsername(System.getProperty("user", "admin"))
         wait.setPassword(System.getProperty("password", "admin"))
         return wait.wait(180000)
@@ -761,23 +767,57 @@ def waitForClusterSetup(OpenSearchCluster cluster, Boolean securityEnabled) {
     }
 }
 
-List<Provider<RegularFile>> plugins = [
-        provider(new Callable<RegularFile>(){
-            @Override
-            RegularFile call() throws Exception {
-                return new RegularFile() {
-                    @Override
-                    File getAsFile() {
-                        return fileTree(bwcFilePath + project.version).getSingleFile()
-                    }
+apply plugin: 'opensearch.opensearchplugin'
+
+ext.resolvePluginFile = { pluginId ->
+    return new Callable<RegularFile>() {
+        @Override
+        RegularFile call() throws Exception {
+            return new RegularFile() {
+                @Override
+                File getAsFile() {
+                    return configurations.opensearchPlugin.resolvedConfiguration.resolvedArtifacts
+                            .find { ResolvedArtifact f ->
+                                f.name.startsWith(pluginId)
+                            }
+                            .file
                 }
             }
-        })
-]
+        }
+    }
+}
+def paFile = resolvePluginFile("opensearch-performance-analyzer")
+
+List<Provider<RegularFile>> plugins = []
+
+//task prepareBwcTests {
+//    dependsOn bundlePlugin
+//    doLast {
+//        plugins = [
+//                provider(paFile)
+//        ]
+//        println "dummy"
+//    }
+//}
+
+//List<Provider<RegularFile>> plugins = [
+//        provider(new Callable<RegularFile>(){
+//            @Override
+//            RegularFile call() throws Exception {
+//                return new RegularFile() {
+//                    @Override
+//                    File getAsFile() {
+//                        return fileTree(bwcFilePath + project.version).getSingleFile()
+//                    }
+//                }
+//            }
+//        })
+//]
 
 // Creates 2 test clusters with 3 nodes of the old version.
 2.times {i ->
     task "${baseName}#oldVersionClusterTask$i"(type: StandaloneRestIntegTestTask) {
+//        dependsOn 'prepareBwcTests'
         useCluster testClusters."${baseName}$i"
         filter {
             includeTestsMatching "org.opensearch.performanceanalyzer.bwc.*IT"
@@ -800,7 +840,13 @@ task "${baseName}#mixedClusterTask"(type: StandaloneRestIntegTestTask) {
         println("Pre-Upgrade mark")
         testClusters."${baseName}0".upgradeNodeAndPluginToNextVersion(plugins)
         println("Post-Upgrade mark")
-        waitForClusterSetup(testClusters."${baseName}$i", securityEnabled)
+//        sleep(180 * 1000)
+
+//        getClusters().forEach { cluster ->
+//            waitForClusterSetup(cluster, securityEnabled)
+//        }
+        println("Post-Wait mark")
+
     }
     filter {
         includeTestsMatching "org.opensearch.performanceanalyzer.bwc.*IT"
